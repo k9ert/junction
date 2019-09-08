@@ -13,7 +13,8 @@ def start_bitcoind(bitcoind_path):
     datadir = tempfile.mkdtemp()
     bitcoind_proc = subprocess.Popen([bitcoind_path, '-regtest', '-datadir=' + datadir, '-noprinttoconsole'])
     def cleanup_bitcoind():
-        bitcoind_proc.kill()
+        bitcoind_proc.kill() # might not be needed but let's be sure, doesn't hurt
+        bitcoind_proc.wait()
         shutil.rmtree(datadir)
     atexit.register(cleanup_bitcoind)
     # Wait for cookie file to be created
@@ -36,7 +37,8 @@ def start_bitcoind(bitcoind_path):
 
     # Make sure there are blocks and coins available
     rpc.generatetoaddress(101, rpc.getnewaddress())
-    return (rpc, rpc_username, rpc_password)
+    rpc._AuthServiceProxy__conn.close()
+    return (rpc, rpc_username, rpc_password, bitcoind_proc)
 
 def write_json_file(data, filename):
     path = os.path.join(junction_dir, filename)

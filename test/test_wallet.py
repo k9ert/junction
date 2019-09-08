@@ -62,7 +62,7 @@ class WalletTests(unittest.TestCase):
         cls.maxDiff = 10000  # FIXME: descriptor test maxed out this parameter
         test_dir = os.path.dirname(os.path.realpath(__file__))
         bitcoind_path = os.path.join(test_dir, 'bitcoin/src/bitcoind')
-        cls.rpc, cls.rpc_username, cls.rpc_password = start_bitcoind(bitcoind_path)
+        cls.rpc, cls.rpc_username, cls.rpc_password, cls.bitcoind_proc = start_bitcoind(bitcoind_path)
 
     def setUp(self):
         # a hack to use a new temporary datadir for every unittest ...
@@ -78,6 +78,17 @@ class WalletTests(unittest.TestCase):
         }
         disk.ensure_datadir()
         disk.write_json_file(settings, 'settings.json')
+        print("Fininshed Setup for method {}".format(self._testMethodName))
+    
+    def tearDown(self):
+        print("Starting TearDown for method {}".format(self._testMethodName))
+        self.rpc._AuthServiceProxy__conn.close()
+        print("Finished TearDown for method {}".format(self._testMethodName))
+    
+    @classmethod
+    def tearDownClass(cls):
+        cls.bitcoind_proc.kill()
+        cls.rpc._AuthServiceProxy__conn.close()
 
     def test_create_wallet_wrong_parameters(self):
         # m > n
@@ -89,6 +100,7 @@ class WalletTests(unittest.TestCase):
         # m capped at 5
         with self.assertRaises(JunctionError):
             wallet = MultisigWallet.create('unittest__test_create_wallet', 3, 6)
+        self.rpc._AuthServiceProxy__conn.close()
 
     def test_create_wallet_valid_2_of_3(self):
         wallet = MultisigWallet.create('unittest__test_create_wallet', 2, 3)
@@ -116,10 +128,13 @@ class WalletTests(unittest.TestCase):
         self.assertTrue(wallet.ready())
         # check that we can derive addresses
         self.assertIsNotNone(wallet.address())
-
         # can't add more signers once wallet "ready"
         with self.assertRaises(JunctionError):
             wallet.add_signer('x', 'x', 'x', 'x')
+
+        self.rpc._AuthServiceProxy__conn.close()
+        print("---------------------------------------------")
+        self.rpc._AuthServiceProxy__conn.close()
 
     def test_create_wallet_already_exists(self):
         disk.write_json_file({}, 'wallets/test_create_wallet_already_exists.json')
@@ -148,6 +163,7 @@ class WalletTests(unittest.TestCase):
         # - not deleted when it shouldn't be
         # 
         # can we create an pre-existing transaction and test that bitcoind finds it?
+        self.rpc._AuthServiceProxy__conn.close()
 
     def test_open_wallet_file_doesnt_exist(self):
         with self.assertRaises(FileNotFoundError):
@@ -161,6 +177,7 @@ class WalletTests(unittest.TestCase):
         wallet = MultisigWallet.open(self._testMethodName)
         # watch-only wallet was created
         self.assertIn(self._testMethodName, self.rpc.listwallets())
+        self.rpc._AuthServiceProxy__conn.close()
 
     def test_save_wallet(self):
         '''Open and save is idempotent'''
@@ -183,16 +200,19 @@ class WalletTests(unittest.TestCase):
     def test_export(self):
         self.rpc.generatetoaddress(1, self.rpc.getnewaddress())
         wallet = make_wallet(self._testMethodName)
-        count = len(wallet.wallet_rpc.listtransactions())
+        with wallet.wallet_rpc as wallet_rpc:
+            count = len(wallet_rpc.listtransactions())
         while wallet.address_index < 201 :  # cross address export boundary
             address = wallet.address()
-            ai = wallet.wallet_rpc.getaddressinfo(address)
-            # Check BIP67
-            self.assertEqual(ai['pubkeys'], sorted(ai['pubkeys']))
-            self.rpc.sendtoaddress(address, .1)
-            count += 1
+            with wallet.wallet_rpc as wallet_rpc:
+                ai = wallet.wallet_rpc.getaddressinfo(address)
+                # Check BIP67
+                self.assertEqual(ai['pubkeys'], sorted(ai['pubkeys']))
+                self.rpc.sendtoaddress(address, .1)
+                count += 1
         self.rpc.generatetoaddress(1, self.rpc.getnewaddress())
         self.assertEqual(len(wallet.wallet_rpc.listtransactions('*', 1000)), count)
+        self.rpc._AuthServiceProxy__conn.close()
 
     def test_create_psbt(self):
         # fixture: get some coins for coin selection
@@ -212,12 +232,14 @@ class WalletTests(unittest.TestCase):
         output_addrs = [vout['scriptPubKey']['addresses'][0] for vout in psbt['tx']['vout']]
         self.assertIn(receiving_address, output_addrs)
         output_addrs.remove(receiving_address)
-        wallet_addrs = wallet.wallet_rpc.deriveaddresses(
-            wallet.descriptor(), 
-            [0, wallet.export_index + 1])  # FIXME: +1 just to be safe
+        with wallet.wallet_rpc as wallet_rpc:
+            wallet_addrs = wallet.wallet_rpc.deriveaddresses(
+                    wallet.descriptor(), 
+                    [0, wallet.export_index + 1])  # FIXME: +1 just to be safe
 
         # the remaining output address (change) belongs to wallet
         self.assertIn(output_addrs[0], wallet_addrs)
+        self.rpc._AuthServiceProxy__conn.close()
 
     def test_signing_complete(self):
         # test with finished and unfinished psbts

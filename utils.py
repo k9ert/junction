@@ -1,3 +1,4 @@
+import logging
 import json
 from os import listdir
 import os.path
@@ -6,6 +7,8 @@ from flask import flash, current_app as app
 from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException
 from hwilib import commands
 from hwilib.devices import coldcard, digitalbitbox, ledger, trezor
+
+log = logging.getLogger("BitcoinRPC")
 
 class JunctionError(Exception):
     pass
@@ -73,9 +76,29 @@ class RPC:
         )
 
     def __getattr__(self, name):
-        '''Create new proxy for every call to prevent timeouts'''
-        rpc = AuthServiceProxy(self.uri, timeout=60)  # 1 minute timeout
-        return getattr(rpc, name)
+        if name == "auth_proxy":
+            print("This should not happen!")
+            raise AttributeError() # Would only be called if aith_proxy doesn't exist
+        print("Calling name: {}".format(name))
+        return getattr(self.auth_proxy, name)
+    
+    def __enter__(self):
+        # Checking whether old self.auth_proxy is set in a quite weird way
+        # try:
+        #    self.auth_proxy
+        #    if self.auth_proxy != None:
+        #        # and close connection if it's there
+        #        self.auth_proxy._AuthServiceProxy__conn.close()
+        #        #print("WARNING: connection hasn't been closed properly")
+        # except AttributeError:
+        #    pass
+        print("Creating AuthServiceProxy")
+        self.auth_proxy = AuthServiceProxy(self.uri, timeout=60)  # 1 minute timeout
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.auth_proxy._AuthServiceProxy__conn.close()
+        self.auth_proxy = None
 
     def test(self):
         '''TODO: move test_rpc logic in here'''
@@ -85,10 +108,11 @@ def test_rpc(settings):
     ''' raises JunctionErrors or Warnings if RPC-connection doesn't work'''
     rpc = RPC(settings=settings)
     try:
-        rpc.getblockchaininfo()
-        if int(rpc.getnetworkinfo()['version']) < 170000:
-           raise JunctionWarning("Update your Bitcoin Node to at least version > 0.17 otherwise this won't work.") 
-        rpc.listwallets()
+        with rpc:
+            rpc.getblockchaininfo()
+            if int(rpc.getnetworkinfo()['version']) < 170000:
+                raise JunctionWarning("Update your Bitcoin Node to at least version > 0.17 otherwise this won't work.") 
+            rpc.listwallets()
     except ConnectionRefusedError as e:
         raise JunctionError("ConnectionRefusedError: check https://bitcoin.stackexchange.com/questions/74337/testnet-bitcoin-connection-refused-111")
     except JSONRPCException as e:

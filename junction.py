@@ -133,7 +133,6 @@ class MultisigWallet:
         # Export next chunk watch-only addresses to Bitcoin Core if we're done adding signers
         if self.ready():
             self.export_watchonly()
-
         self.save()
 
     def remove_signer(signer_name):
@@ -152,7 +151,8 @@ class MultisigWallet:
         descriptor = f"sh(multi({self.m},{xpubs}))"
         logger.info(f"Exporting descriptor: {descriptor}")
         # validates and appends checksum
-        r = self.wallet_rpc.getdescriptorinfo(descriptor)
+        with self.wallet_rpc as wallet_rpc:
+            r = wallet_rpc.getdescriptorinfo(descriptor)
         return r['descriptor']
 
     def address(self):
@@ -161,14 +161,16 @@ class MultisigWallet:
             raise JunctionError(f'{self.n} signers required, {len(self.signers)} registered')
         if self.address_index > self.export_index:
             self.export_watchonly()
-        address = self.wallet_rpc.deriveaddresses(
-            self.descriptor(), 
-            [self.address_index, self.address_index + 1])[0]
+        with self.wallet_rpc as wallet_rpc:            
+            address = wallet_rpc.deriveaddresses(
+                self.descriptor(), 
+                [self.address_index, self.address_index + 1])[0]
         self.address_index += 1
 
         # Hackily skip BIP67 (sorted multisig pubkeys) violations
         # (ColdCard demands BIP67 compliance, descriptor language doesn't support)
-        ai = self.wallet_rpc.getaddressinfo(address)
+        with self.wallet_rpc as wallet_rpc:
+            ai = self.wallet_rpc.getaddressinfo(address)
         assert ai['iswatchonly'] is True, 'Bitcoin Core gave us non-watch-only address'
         if ai['pubkeys'] != sorted(ai['pubkeys']):
             return self.address()
@@ -180,18 +182,21 @@ class MultisigWallet:
         # Create watch-only Bitcoin Core wallet
         watch_only_name = self.watchonly_name()
         try:
-            bitcoin_wallets = self.default_rpc.listwallets()
+            with self.default_rpc as default_rpc:
+                bitcoin_wallets = default_rpc.listwallets()
         except Exception as e:
             # handle_exception(e)  # Janky: don't bring flask into this
             # probably should just let RPC exception bubble up and catch this in caller
             raise JunctionError(e)
         if watch_only_name not in bitcoin_wallets:
             try:
-                self.default_rpc.loadwallet(watch_only_name)
+                with self.default_rpc as default_rpc:
+                    default_rpc.loadwallet(watch_only_name)
                 logger.info(f"Loaded watch-only Bitcoin Core wallet \"{watch_only_name}\"")
             except JSONRPCException as e:
                 try:
-                    self.default_rpc.createwallet(watch_only_name, True)
+                    with self.default_rpc as default_rpc:
+                        default_rpc.createwallet(watch_only_name, True)
                     logger.info(f"Created watch-only Bitcoin Core wallet \"{watch_only_name}\"")
                 except JSONRPCException as e:
                     raise JunctionError("Couldn't establish watch-only Bitcoin Core wallet")
@@ -204,17 +209,18 @@ class MultisigWallet:
         '''Export addresses to Bitcoin Core watch-only wallet'''
         logger.info("Starting watch-only export")
         new_export_index = self.export_index + ADDRESS_CHUNK
-        self.wallet_rpc.importmulti([{
-            "desc": self.descriptor(),
-            # 24 hours just in case
-            "timestamp": int(time.time()) - 60*60*24,
-            # FIXME: is this inclusive? if we we're overlapping 1 ever time ...
-            "range": [self.export_index, new_export_index],
-            "watchonly": True,
-            # Bitcoin Core cannot import P2SH/P2WSH: https://bitcoin.stackexchange.com/a/89118/85335
-            "keypool": False,
-            "internal": False,
-        }])
+        with self.wallet_rpc as wallet_rpc:
+            wallet_rpc.importmulti([{
+                "desc": self.descriptor(),
+                # 24 hours just in case
+                "timestamp": int(time.time()) - 60*60*24,
+                # FIXME: is this inclusive? if we we're overlapping 1 ever time ...
+                "range": [self.export_index, new_export_index],
+                "watchonly": True,
+                # Bitcoin Core cannot import P2SH/P2WSH: https://bitcoin.stackexchange.com/a/89118/85335
+                "keypool": False,
+                "internal": False,
+            }])
         self.export_index = new_export_index
         self.save()
         logger.info("Finished watch-only export")
@@ -224,22 +230,23 @@ class MultisigWallet:
         if self.psbt:
             raise JunctionError('PSBT already present')
         change_address = self.address()
-        raw_psbt = self.wallet_rpc.walletcreatefundedpsbt(
-            # let Bitcoin Core choose inputs
-            [],
-            # Outputs
-            [{recipient: sat_to_btc(satoshis)}],
-            # Locktime
-            0, 
-            {
-                # Include watch-only outputs
-                "includeWatching": True,
-                # Provide change address b/c Core can't generate it
-                "changeAddress": change_address,
-            },
-            # Include BIP32 derivation paths in the PSBT
-            True,
-        )['psbt']
+        with self.wallet_rpc as wallet_rpc:
+            raw_psbt = wallet_rpc.walletcreatefundedpsbt(
+                # let Bitcoin Core choose inputs
+                [],
+                # Outputs
+                [{recipient: sat_to_btc(satoshis)}],
+                # Locktime
+                0, 
+                {
+                    # Include watch-only outputs
+                    "includeWatching": True,
+                    # Provide change address b/c Core can't generate it
+                    "changeAddress": change_address,
+                },
+                # Include BIP32 derivation paths in the PSBT
+                True,
+            )['psbt']
         # Serialize and save
         self.psbt = hwilib.serializations.PSBT()
         self.psbt.deserialize(raw_psbt)
@@ -250,10 +257,11 @@ class MultisigWallet:
 
     def decode_psbt(self):
         '''Fetch Bitcoin Core psbt deserialization if it exists'''
-        if self.psbt:
-            return self.wallet_rpc.decodepsbt(self.psbt.serialize())
-        else:
-            return None
+        with self.wallet_rpc as wallet_rpc:
+            if self.psbt:
+                return wallet_rpc.decodepsbt(self.psbt.serialize())
+            else:
+                return None
 
     def signing_complete(self):
         '''Check that we have m signatures'''
@@ -262,14 +270,16 @@ class MultisigWallet:
     def broadcast(self):
         '''Finalize and broadcast psbt to network'''
         psbt_hex = self.psbt.serialize()
-        tx_hex = self.wallet_rpc.finalizepsbt(psbt_hex)["hex"]
-        return self.wallet_rpc.sendrawtransaction(tx_hex)
+        with self.wallet_rpc as wallet_rpc:
+            tx_hex = wallet_rpc.finalizepsbt(psbt_hex)["hex"]
+            return wallet_rpc.sendrawtransaction(tx_hex)
     
     def balances(self):
         '''(unconfirmed, confirmed) balances tuple'''
         # try to use new getbalances rpc (available in bitcoin core master branch)
         try:
-            balances = self.wallet_rpc.getbalances()
+            with self.wallet_rpc as wallet_rpc:
+                balances = wallet_rpc.getbalances()
             if 'watchonly' in balances:
                 watchonly = balances['watchonly']
                 return watchonly['untrusted_pending'], watchonly['trusted']
@@ -279,7 +289,8 @@ class MultisigWallet:
         except:
             unconfirmed_balance = 0
             confirmed_balance = 0
-            unspent = self.wallet_rpc.listunspent(0, 9999999, [], True)
+            with self.wallet_rpc as wallet_rpc:
+                unspent = wallet_rpc.listunspent(0, 9999999, [], True)
             for u in unspent:
                 if u['confirmations'] > 0:
                     confirmed_balance += u['amount']
